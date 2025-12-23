@@ -44,27 +44,9 @@ def add_labels(
     df[up_col] = (df[future_col] >= TH).astype(int)
     df[down_col] = (df[future_col] <= -TH).astype(int)
 
+    # 3) drop samples whose future returns are not observable
+    data_train = data.dropna(subset=["future_ret_H"]).copy()
+
     return df
 
 
-def make_train_dataset(
-    data: pd.DataFrame,
-    future_col: str = "future_ret_H",
-) -> pd.DataFrame:
-    """
-    删除未来不可见样本（未来收益为 NaN 的行）。
-
-    参数
-    ----
-    data : pd.DataFrame
-        已经包含 future_col 的数据
-    future_col : str
-        未来收益列名（默认 'future_ret_H'）
-
-    返回
-    ----
-    data_train : pd.DataFrame
-        过滤掉尾部无法打标签样本后的训练集
-    """
-    mask = data[future_col].notna()
-    return data.loc[mask].copy()
