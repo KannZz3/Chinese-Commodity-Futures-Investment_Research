@@ -132,45 +132,53 @@ def fill_missing_values(data: pd.DataFrame):
         else:
             return data[col]  # 如果没有有效范围，返回整个列
 
-    # ========== 1. 动量 / slope / ret类 ==========
-    for c in data.columns:
-        if c.startswith("mom_") or "slope" in c or c == "ret_1":
-            valid_range = get_valid_range(c)
-            if valid_range.size > 0:  # 只在有效范围内填补
-                print(f"Before filling {c}, NaN count: {data[c].isna().sum()}")
-                data[c] = data[c].fillna(method='ffill')  # 前值填补
-                print(f"After filling {c}, NaN count: {data[c].isna().sum()}")
-               
-    # ========== 2. MA 均线 ==========
-    for c in data.columns:
-        if c.startswith("ma_") and "slope" not in c:
-            valid_range = get_valid_range(c)
-            if valid_range.size > 0:  # 只在有效范围内填补
-                print(f"Before filling {c}, NaN count: {data[c].isna().sum()}")
-                data[c] = data[c].fillna(data["close"])
-                print(f"After filling {c}, NaN count: {data[c].isna().sum()}")
-
     # ========== 4. 检验后, 特殊处理部分 ==========
-    # 处理 `mom_2_slope_3` 和 `mom_4_slope_3` 的缺失值，使用前值填补
-    for c in ["mom_2_slope_3", "mom_4_slope_3"]:
-        valid_range = get_valid_range(c)
-        if valid_range.size > 0:
-            print(f"Before filling {c}, NaN count: {data[c].isna().sum()}")
-            data[c] = data[c].fillna(method="ffill")  
-            print(f"After filling {c}, NaN count: {data[c].isna().sum()}")
 
-    # 处理比率因子的缺失值：使用前值填补
-    for c in ["body_pct", "upper_shadow_pct", "lower_shadow_pct"]:
+    # 1) 这些 slope 类因子：用“前两天均值”填补 NaN
+    special_prev2_cols = [
+        "vol_2_slope", "vol_2_slope_3", "vol_2_slope_5", "vol_2_slope_10", "vol_2_slope_25",
+        "mom_16_slope", "mom_16_slope_3", "mom_16_slope_5", "mom_16_slope_10", "mom_16_slope_25",
+        "mom_8_slope", "mom_8_slope_3", "mom_8_slope_5", "mom_8_slope_10", "mom_8_slope_25",
+        "mom_4_slope", "mom_4_slope_3", "mom_4_slope_5", "mom_4_slope_10", "mom_4_slope_25",
+        "mom_2_slope", "mom_2_slope_3", "mom_2_slope_5", "mom_2_slope_10", "mom_2_slope_25",
+    ]
+
+    for c in special_prev2_cols:
+        if c not in data.columns:
+            continue
+        valid_range = get_valid_range(c)
+        if valid_range.size > 0:
+            print(f"Before prev2-mean filling {c}, NaN count: {data[c].isna().sum()}")
+            prev2_mean = valid_range.shift(1).rolling(window=2, min_periods=1).mean()
+            data.loc[valid_range.index, c] = data.loc[valid_range.index, c].fillna(prev2_mean)
+            print(f"After  prev2-mean filling {c}, NaN count: {data[c].isna().sum()}")
+
+    # 2) `mom_2_slope_3` 和 `mom_4_slope_3`：前值填补
+    for c in ["mom_2_slope_3", "mom_4_slope_3"]:
+        if c not in data.columns:
+            continue
         valid_range = get_valid_range(c)
         if valid_range.size > 0:
             print(f"Before filling {c}, NaN count: {data[c].isna().sum()}")
-            data[c] = data[c].fillna(method="ffill") 
-            print(f"After filling {c}, NaN count: {data[c].isna().sum()}")
+            data[c] = data[c].fillna(method="ffill")
+            print(f"After  filling {c}, NaN count: {data[c].isna().sum()}")
+
+    # 3) 比率因子：前值填补
+    for c in ["body_pct", "upper_shadow_pct", "lower_shadow_pct"]:
+        if c not in data.columns:
+            continue
+        valid_range = get_valid_range(c)
+        if valid_range.size > 0:
+            print(f"Before filling {c}, NaN count: {data[c].isna().sum()}")
+            data[c] = data[c].fillna(method="ffill")
+            print(f"After  filling {c}, NaN count: {data[c].isna().sum()}")
+
+    # 4) 删除所有因子中“最晚开始有有效值”之前的行（确保所有因子都有有效值）
     first_pos = []
     for c in data.columns:
         m = data[c].notna().to_numpy()
-        if m.any():                      # 该列至少有一个有效值
-            first_pos.append(int(m.argmax()))  # 首个有效值位置 = leading NaN 行数
+        if m.any():
+            first_pos.append(int(m.argmax()))
     max_leading = max(first_pos) if first_pos else 0
 
     return data.iloc[max_leading:].copy()
@@ -179,4 +187,186 @@ def fill_missing_values(data: pd.DataFrame):
 # =========================
 # 3. 因子预处理
 # =========================
+class FeaturePreprocessor:
+    def __init__(
+        self,
+        heavy_kurtosis=6,
+        clip_pct=(0.1, 99.9),
+        log_candidates=("volume", "hold"),
+        sigma_clip=6,
+        robust=False,
+        check_finite=True,
+    ):
+        self.heavy_kurtosis = heavy_kurtosis
+        self.clip_low, self.clip_high = clip_pct
+        self.log_candidates = tuple(log_candidates)
+        self.sigma_clip = sigma_clip
+        self.use_robust = robust
+        self.check_finite = check_finite
+
+        self.feature_cols = None
+        self.heavy_cols = []
+
+        # heavy cols percentile bounds: {col: (lo, hi)}
+        self.clip_bounds = {}
+
+        # sigma-clip bounds for cols: {col: (mean, std)}
+        self.sigma_bounds = {}
+
+        self.scaler = None
+        self.is_fitted = False
+
+    # ============================
+    # utils
+    # ============================
+    def _check_no_nan_inf(self, X: pd.DataFrame, where: str):
+        if not self.check_finite:
+            return
+
+        arr = X.to_numpy(dtype=float, copy=False)
+        if np.isfinite(arr).all():
+            return
+
+        bad = ~np.isfinite(arr)
+        i, j = np.argwhere(bad)[0]
+        col = X.columns[j]
+        idx = X.index[i]
+        v = X.iloc[i, j]
+
+        raise ValueError(
+            f"[{where}] found non-finite value at index={idx}, col='{col}', value={v}. "
+            "This preprocessor does NOT handle NaN/inf; please clean data before calling."
+        )
+
+    # ============================
+    # 1) detect heavy-tail columns
+    # ============================
+    def _detect_heavy(self, X: pd.DataFrame):
+        heavy = []
+        for c in self.feature_cols:
+            if ("slope" in c) or ("ret" in c):
+                continue
+
+            x = X[c].to_numpy(dtype=float, copy=False)
+            try:
+                k = kurtosis(x, fisher=False, bias=False)
+                if np.isfinite(k) and (k > self.heavy_kurtosis):
+                    heavy.append(c)
+            except Exception:
+                # 保守：检测失败就不自动归为 heavy
+                pass
+
+        return heavy
+
+    # ============================
+    # 2) signed-log with percentile clip (NO NaN handling)
+    # ============================
+    def _signed_log_clip(self, x: np.ndarray, col: str, fit: bool):
+        x = np.asarray(x, dtype=float)
+
+        if fit:
+            lo, hi = np.percentile(x, [self.clip_low, self.clip_high])
+
+            # 常数列/异常列兜底：避免 lo>=hi
+            if (not np.isfinite(lo)) or (not np.isfinite(hi)) or (lo >= hi):
+                m = float(np.mean(x))
+                eps = 1e-12
+                lo, hi = m - eps, m + eps
+
+            self.clip_bounds[col] = (float(lo), float(hi))
+        else:
+            lo, hi = self.clip_bounds[col]
+
+        x = np.clip(x, lo, hi)
+        return np.sign(x) * np.log1p(np.abs(x))
+
+    # ============================
+    # 3) sigma-clip for ALL columns (NO NaN handling)
+    # ============================
+    def _sigma_clip(self, x: np.ndarray, col: str, fit: bool):
+        x = np.asarray(x, dtype=float)
+
+        if fit:
+            m = float(np.mean(x))
+            sd = float(np.std(x)) + 1e-12
+            self.sigma_bounds[col] = (m, sd)
+        else:
+            m, sd = self.sigma_bounds[col]
+
+        lo = m - self.sigma_clip * sd
+        hi = m + self.sigma_clip * sd
+        return np.clip(x, lo, hi)
+
+    # ============================
+    # 4) fit(train)
+    # ============================
+    def fit(self, df: pd.DataFrame, feature_cols):
+        """
+        假设 df[feature_cols] 已经在外部处理完 NaN/inf，这里只做：
+        1) heavy: percentile clip + signed-log（训练期学边界）
+        2) all features: 均值±sigma_clip*std 的 σ-clip（训练期学 m, sd）
+        3) scaler fit（训练期）
+        """
+        assert df.index.is_monotonic_increasing, "df must be sorted in ascending time order"
+        assert df.index.is_unique, "df index must be unique"
+        assert isinstance(df.index, pd.DatetimeIndex), "df.index must be a DatetimeIndex"
+
+        self.feature_cols = list(feature_cols)
+        X = df[self.feature_cols].copy()
+
+        self._check_no_nan_inf(X, where="fit")
+
+        # ===== heavy cols: auto + manual =====
+        auto_heavy = self._detect_heavy(X)
+        manual_heavy = [c for c in self.log_candidates if c in self.feature_cols]
+        self.heavy_cols = sorted(set(auto_heavy + manual_heavy))
+
+        # ===== apply transforms on TRAIN to learn bounds =====
+        Xp = X.copy()
+
+        for col in self.heavy_cols:
+            Xp[col] = self._signed_log_clip(Xp[col].to_numpy(copy=False), col, fit=True)
+
+        for col in self.feature_cols:
+            Xp[col] = self._sigma_clip(Xp[col].to_numpy(copy=False), col, fit=True)
+
+        self.scaler = RobustScaler() if self.use_robust else StandardScaler()
+        self.scaler.fit(Xp[self.feature_cols])
+
+        self.is_fitted = True
+        return self
+
+    # ============================
+    # 5) transform(test/val)
+    # ============================
+    def transform(self, df: pd.DataFrame):
+        if not self.is_fitted:
+            raise RuntimeError("Call fit(train) before transform(test).")
+        
+        assert df.index.is_monotonic_increasing, "df must be sorted in ascending time order"
+        assert df.index.is_unique, "df index must be unique"
+        assert isinstance(df.index, pd.DatetimeIndex), "df.index must be a DatetimeIndex"
+
+        X = df[self.feature_cols].copy()
+        self._check_no_nan_inf(X, where="transform")
+
+        Xp = X.copy()
+
+        for col in self.heavy_cols:
+            Xp[col] = self._signed_log_clip(Xp[col].to_numpy(copy=False), col, fit=False)
+
+        for col in self.feature_cols:
+            Xp[col] = self._sigma_clip(Xp[col].to_numpy(copy=False), col, fit=False)
+
+        Z = self.scaler.transform(Xp[self.feature_cols])
+
+        out = df.copy()
+        out[self.feature_cols] = Z
+        return out
+
+    def report(self, df: pd.DataFrame):
+        X = df[self.feature_cols]
+        stats = X.describe().T
+        print(stats[["mean", "std", "min", "max"]])
+        print("\nMax abs:", X.abs().to_numpy().max())
 
