@@ -1,4 +1,4 @@
-# Score/Score_fun.py
+# Score/score_fun.py
 
 import numpy as np
 import pandas as pd
