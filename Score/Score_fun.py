@@ -3,11 +3,11 @@
 import numpy as np
 import pandas as pd
 
-__all__ = ["add_score"]
+__all__ = ["add_score", "choose_T_from_train"]
 
 # ============================
-# Factor scoring
-# 因子得分计算
+# 1) Score construction
+# 1) 分数构造
 # ============================
 
 def add_score(
@@ -333,4 +333,124 @@ def add_score(
     df["score"]       = df["score_long"] - df["score_short"]
 
     return df
+
+
+# ============================
+# 2) Threshold selection (T)
+# 2) 阈值选择（T）
+# ============================
+
+def choose_T_from_train(
+    train_df,
+    score_col="score",
+    q=0.80,          # default: use the 80% quantile of |score| / 默认：|score| 的 80% 分位数（比 0.95 更宽松）
+    min_T=0.5,       # only trade when |score| >= min_T / 硬下限：|score| 至少达到该强度才交易
+    max_T=None,      # optional cap to prevent too-large T / 可选上限：防止 T 过大导致几乎不交易
+    verbose=True
+):
+    """
+    Choose a signal threshold T from the training sample (score distribution).
+    从训练集（score 分布）中选择信号阈值 T。
+
+    Purpose / 目的
+    --------------
+    We later use T in rules like:
+        open a position only if |score| > T
+    后续用 T 作为开仓强度过滤：
+        仅当 |score| > T 才开仓
+
+    Interpretation of score / score 的含义
+    --------------------------------------
+    1) `score` is directional:
+           score > 0  → bullish bias
+           score < 0  → bearish bias
+       `score` 本身带方向：
+           score > 0 → 偏多
+           score < 0 → 偏空
+
+    2) Add a strength threshold T to avoid over-trading on weak signals:
+           score >  T  → open long
+           score < -T  → open short
+       加强度阈值 T，避免弱信号频繁交易：
+           score >  T  → 做多开仓
+           score < -T  → 做空开仓
+
+    How T is chosen / T 的选择方法
+    ------------------------------
+    Step A) Data-driven threshold:
+        T_data = q-quantile of |score|
+        数据驱动阈值：
+        T_data = |score| 的 q 分位数
+
+    Step B) Enforce a lower bound:
+        T = max(T_data, min_T)
+        加硬下限：
+        T = max(T_data, min_T)
+
+    Step C) Optional upper cap:
+        if max_T is given: T = min(T, max_T)
+        可选上限：
+        若给定 max_T：T = min(T, max_T)
+
+    Design intuition / 设计直觉
+    ---------------------------
+    - Always require |score| to be at least min_T before trading.
+      始终要求 |score| 至少达到 min_T 才允许交易。
+    - If the score distribution is volatile (larger tails), T_data increases,
+      which automatically reduces trade frequency.
+      若 score 分布更“剧烈”（尾部更大），T_data 会自动增大，从而降低交易频率。
+    """
+
+    # ============================================================
+    # 0) Sanity checks
+    # 0) 基本检查
+    # ============================================================
+    if score_col not in train_df.columns:
+        raise KeyError(f"[choose_T_from_train] '{score_col}' not found in train_df columns.")
+
+    # Extract score series, drop NaN, ensure float dtype
+    # 取出 score 序列：去掉 NaN，并强制转为 float
+    s = train_df[score_col].dropna().astype(float)
+
+    if len(s) == 0:
+        raise ValueError("[choose_T_from_train] Training scores are all NaN; cannot estimate T.")
+
+    # ============================================================
+    # 1) Data-driven threshold: q-quantile of |score|
+    # 1) 数据驱动阈值：|score| 的 q 分位数
+    # ============================================================
+    T_data = s.abs().quantile(q)
+
+    # ============================================================
+    # 2) Enforce at least min_T
+    # 2) 加硬下限：至少为 min_T
+    # ============================================================
+    T_final = max(T_data, float(min_T))
+
+    # ============================================================
+    # 3) Optional upper cap
+    # 3) 可选上限：不超过 max_T
+    # ============================================================
+    if max_T is not None:
+        T_final = min(T_final, float(max_T))
+
+    # ============================================================
+    # 4) Logging / diagnostics
+    # 4) 打印信息 / 诊断输出
+    # ============================================================
+    if verbose:
+        msg = (
+            f"[choose_T_from_train] "
+            f"T_data(q={q:.2f})={T_data:.4f}, "
+            f"min_T={min_T:.4f}"
+        )
+        if max_T is not None:
+            msg += f", max_T={max_T:.4f}"
+        msg += f" → T={T_final:.4f}"
+        print(msg)
+
+    return float(T_final)
+
+
+
 
